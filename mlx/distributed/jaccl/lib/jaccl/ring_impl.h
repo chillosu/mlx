@@ -3,6 +3,7 @@
 #pragma once
 
 #include <future>
+#include <iostream>
 #include <span>
 
 #include "jaccl/rdma.h"
@@ -394,11 +395,23 @@ class RingImpl {
         ibv_wc wc[WC_NUM];
         int n = poll_wire(lw, WC_NUM, wc);
         for (int i = 0; i < n; i++) {
+          in_flight--;
+
+          // A failed or spurious completion carries an undefined wr_id, so
+          // the decoded direction and buff would index the counters and
+          // buffer pools out of bounds. Drop it and keep draining; the
+          // in-flight slot is already retired above.
           int work_type = wc[i].wr_id >> 16;
           int buff = (wc[i].wr_id >> 8) & 0xff;
           int lr = wc[i].wr_id & 0xff;
-
-          in_flight--;
+          if (wc[i].status != IBV_WC_SUCCESS || lr >= MAX_DIR ||
+              buff >= PIPELINE) {
+            std::cerr << IBV_TAG << " rank " << rank_
+                      << ": dropped bad reduce_scatter completion (status="
+                      << wc[i].status << ", wr_id=0x" << std::hex << wc[i].wr_id
+                      << std::dec << ")" << std::endl;
+            continue;
+          }
 
           if (work_type == SEND_WR) {
             if (send_count[lr] < n_steps) {
@@ -522,11 +535,23 @@ class RingImpl {
         ibv_wc wc[WC_NUM];
         int n = poll_wire(lw, WC_NUM, wc);
         for (int i = 0; i < n; i++) {
+          in_flight--;
+
+          // A failed or spurious completion carries an undefined wr_id, so
+          // the decoded direction and buff would index the counters and
+          // buffer pools out of bounds. Drop it and keep draining; the
+          // in-flight slot is already retired above.
           int work_type = wc[i].wr_id >> 16;
           int buff = (wc[i].wr_id >> 8) & 0xff;
           int lr = wc[i].wr_id & 0xff;
-
-          in_flight--;
+          if (wc[i].status != IBV_WC_SUCCESS || lr >= MAX_DIR ||
+              buff >= PIPELINE) {
+            std::cerr << IBV_TAG << " rank " << rank_
+                      << ": dropped bad ring_pass completion (status="
+                      << wc[i].status << ", wr_id=0x" << std::hex << wc[i].wr_id
+                      << std::dec << ")" << std::endl;
+            continue;
+          }
 
           if (work_type == SEND_WR && send_count[lr] < n_steps) {
             int64_t offset = wire_offset[lr] + send_count[lr] * N;
@@ -633,9 +658,18 @@ class RingImpl {
       ibv_wc wc[WC_NUM];
       int n = conns[lw].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-
         in_flight--;
+
+        // Same guard as the collective loops above: drop failed or spurious
+        // completions whose wr_id would index the buffer pool out of bounds.
+        int buff = (wc[i].wr_id >> 8) & 0xff;
+        if (wc[i].status != IBV_WC_SUCCESS || buff >= PIPELINE) {
+          std::cerr << IBV_TAG << " rank " << rank_
+                    << ": dropped bad send completion (status=" << wc[i].status
+                    << ", wr_id=0x" << std::hex << wc[i].wr_id << std::dec
+                    << ")" << std::endl;
+          continue;
+        }
 
         if (read_offset < limit) {
           std::copy(
@@ -707,9 +741,18 @@ class RingImpl {
       ibv_wc wc[WC_NUM];
       int n = conns[lw].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-
         in_flight--;
+
+        // Same guard as the collective loops above: drop failed or spurious
+        // completions whose wr_id would index the buffer pool out of bounds.
+        int buff = (wc[i].wr_id >> 8) & 0xff;
+        if (wc[i].status != IBV_WC_SUCCESS || buff >= PIPELINE) {
+          std::cerr << IBV_TAG << " rank " << rank_
+                    << ": dropped bad recv completion (status=" << wc[i].status
+                    << ", wr_id=0x" << std::hex << wc[i].wr_id << std::dec
+                    << ")" << std::endl;
+          continue;
+        }
 
         std::copy(
             recv_buffer(sz, buff, dir, lw).begin<char>(),
