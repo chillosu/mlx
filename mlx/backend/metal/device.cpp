@@ -1,7 +1,11 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <sstream>
+#include <time.h>
+#include <unordered_map>
 
 #include <fmt/format.h>
 
@@ -31,6 +35,32 @@ struct hash<NS::SharedPtr<T>> {
 namespace mlx::core::metal {
 
 namespace {
+
+// MLX_CB_TRACE=<file>: append one line per committed command buffer with CPU
+// encode/commit times and the Metal kernel/GPU timestamps (all in us, same
+// clock as mach_absolute_time / Python time.monotonic()).
+inline double cb_trace_now_us() {
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-3;
+}
+FILE* cb_trace_file() {
+  static FILE* f = []() -> FILE* {
+    const char* p = std::getenv("MLX_CB_TRACE");
+    return p ? std::fopen(p, "a") : nullptr;
+  }();
+  return f;
+}
+std::mutex cb_trace_names_mtx;
+std::unordered_map<const void*, std::string> cb_trace_names;
+void cb_trace_register(const void* kernel, const std::string& name) {
+  std::lock_guard lk(cb_trace_names_mtx);
+  cb_trace_names.emplace(kernel, name);
+}
+const std::string& cb_trace_name(const void* kernel) {
+  static const std::string unknown = "?";
+  std::lock_guard lk(cb_trace_names_mtx);
+  auto it = cb_trace_names.find(kernel);
+  return it == cb_trace_names.end() ? unknown : it->second;
+}
 
 constexpr const char* default_mtllib_path = METAL_PATH;
 
@@ -405,6 +435,15 @@ void CommandEncoder::maybeInsertBarrier() {
   next_outputs_.clear();
 }
 
+void CommandEncoder::set_compute_pipeline_state(
+    MTL::ComputePipelineState* kernel) {
+  get_command_encoder()->setComputePipelineState(kernel);
+  if (cb_trace_file()) {
+    cb_names_ += cb_trace_name(kernel);
+    cb_names_ += ',';
+  }
+}
+
 void CommandEncoder::dispatch_threadgroups(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
@@ -517,6 +556,29 @@ void CommandEncoder::commit(std::function<void()> completion) {
   // Metal locks a command buffer's residency at commit time, so attach any
   // sets created since the last commit first.
   residency_sets_.attach_new_sets(queue_.get(), sets_attached_);
+  if (auto f = cb_trace_file(); f && buffer_ops_ > 0) {
+    double t_commit = cb_trace_now_us();
+    int ops = buffer_ops_;
+    double enc_start = enc_start_us_;
+    std::string names = std::move(cb_names_);
+    cb_names_.clear();
+    buffer_->addCompletedHandler([=](MTL::CommandBuffer* cb) {
+      double done = cb_trace_now_us();
+      std::fprintf(
+          f,
+          "cb ops=%d enc_start=%.3f commit=%.3f kstart=%.3f kend=%.3f gstart=%.3f gend=%.3f done=%.3f names=%s\n",
+          ops,
+          enc_start,
+          t_commit,
+          cb->kernelStartTime() * 1e6,
+          cb->kernelEndTime() * 1e6,
+          cb->GPUStartTime() * 1e6,
+          cb->GPUEndTime() * 1e6,
+          done,
+          names.c_str());
+      std::fflush(f);
+    });
+  }
   buffer_->addCompletedHandler(
       [&error_ = error_,
        wait_events = std::move(wait_events_),
@@ -576,6 +638,9 @@ void CommandEncoder::synchronize() {
 MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
   if (!encoder_) {
     error_.check();
+    if (cb_trace_file()) {
+      enc_start_us_ = cb_trace_now_us();
+    }
     encoder_ = NS::RetainPtr(
         buffer_->computeCommandEncoder(MTL::DispatchTypeConcurrent));
     fence_ = NS::TransferPtr(device_.mtl_device()->newFence());
@@ -742,6 +807,9 @@ NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
   if (mtl_function) {
     kernel =
         NS::TransferPtr(device_->newComputePipelineState(mtl_function, &error));
+  }
+  if (kernel && cb_trace_file()) {
+    cb_trace_register(kernel.get(), name);
   }
 
   // Throw error if unable to compile metal function

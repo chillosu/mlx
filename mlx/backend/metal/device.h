@@ -56,9 +56,7 @@ class MLX_API CommandEncoder {
   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
   void maybeInsertBarrier();
 
-  void set_compute_pipeline_state(MTL::ComputePipelineState* kernel) {
-    get_command_encoder()->setComputePipelineState(kernel);
-  }
+  void set_compute_pipeline_state(MTL::ComputePipelineState* kernel);
 
   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
   void set_vector_bytes(const Vec& vec, size_t nelems, int idx) {
@@ -111,6 +109,8 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
+  double enc_start_us_{0}; // MLX_CB_TRACE: CPU time the encoder was created
+  std::string cb_names_; // MLX_CB_TRACE: kernel names dispatched in this cb
 
   // The residency set and how many of its sets this queue has attached.
   ResidencySets& residency_sets_;
